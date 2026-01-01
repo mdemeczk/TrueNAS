@@ -1,6 +1,6 @@
 #!/bin/sh
 # TrueNAS / FreeBSD rclone B2 backup with lock + daily logs.
-# Works for both cron and manual runs.
+# Cron + manual safe (single instance via lockf).
 
 set -eu
 
@@ -9,13 +9,11 @@ SRC="${SRC:-/data}"
 BUCKET="${BUCKET:-backblaze:truenas-backup-mdemeczky}"
 DST="${BUCKET}/current"
 
-# FreeBSD-safe date formats (no -I*, no %F)
 DATE="$(date +"%Y-%m-%d")"
 NOW() { date +"%Y-%m-%d %H:%M:%S"; }
 
 LOGFILE="/var/log/rclone-b2-${DATE}.log"
 
-# Defaults (override via env if you want)
 TRANSFERS="${TRANSFERS:-4}"
 CHECKERS="${CHECKERS:-8}"
 PROGRESS=0
@@ -26,8 +24,8 @@ usage() {
 Usage: $0 [--progress] [--dry-run]
 
 Options:
-  --progress   Show progress (useful for manual runs)
-  --dry-run    Do not make changes, just show what would happen
+  --progress   Show progress (manual runs)
+  --dry-run    No changes, show actions only
 
 Env overrides:
   SRC=/data
@@ -37,7 +35,6 @@ Env overrides:
 EOF
 }
 
-# Parse args
 while [ $# -gt 0 ]; do
   case "$1" in
     --progress) PROGRESS=1 ;;
@@ -48,32 +45,36 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# Ensure paths exist
-mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null || true
+mkdir -p /var/log 2>/dev/null || true
+mkdir -p /var/run 2>/dev/null || true
 
-# Build rclone args
-RCLONE_ARGS=""
-RCLONE_ARGS="$RCLONE_ARGS --backup-dir ${BUCKET}/deleted/${DATE}"
-RCLONE_ARGS="$RCLONE_ARGS --transfers ${TRANSFERS}"
-RCLONE_ARGS="$RCLONE_ARGS --checkers ${CHECKERS}"
-RCLONE_ARGS="$RCLONE_ARGS --log-file ${LOGFILE}"
-RCLONE_ARGS="$RCLONE_ARGS --log-level INFO"
+# Build rclone args (as positional args, not a single string)
+set -- \
+  "--backup-dir" "${BUCKET}/deleted/${DATE}" \
+  "--transfers" "${TRANSFERS}" \
+  "--checkers" "${CHECKERS}" \
+  "--log-file" "${LOGFILE}" \
+  "--log-level" "INFO"
 
 if [ "$PROGRESS" -eq 1 ]; then
-  RCLONE_ARGS="$RCLONE_ARGS --progress"
+  set -- "$@" "--progress"
 fi
 
 if [ "$DRYRUN" -eq 1 ]; then
-  RCLONE_ARGS="$RCLONE_ARGS --dry-run"
+  set -- "$@" "--dry-run"
 fi
 
-# Run under lock (FreeBSD lockf). If already running, lockf exits immediately due to -t 0.
-lockf -t 0 "$LOCKFILE" sh -c "
-  echo \"[$(NOW)] Starting rclone sync: ${SRC} -> ${DST}\" >> \"${LOGFILE}\"
-  rclone sync \"${SRC}\" \"${DST}\" ${RCLONE_ARGS}
-  rc=\$?
-  echo \"[$(NOW)] Finished rclone sync with exit code: \$rc\" >> \"${LOGFILE}\"
-  exit \$rc
-"
+# If already running, exit cleanly and log it.
+if ! lockf -t 0 "$LOCKFILE" true 2>/dev/null; then
+  echo "[$(NOW)] Another backup is already running. Exiting." >> "$LOGFILE"
+  exit 0
+fi
 
+# Run under the lock (this keeps the lock for the whole command)
+lockf -t 0 "$LOCKFILE" sh -c '
+  echo "['"$(NOW)"'] Starting rclone sync: '"$SRC"' -> '"$DST"'" >> "'"$LOGFILE"'"
+  rclone sync "'"$SRC"'" "'"$DST"'" "$@"
+  rc=$?
+  echo "['"$(NOW)"'] Finished rclone sync with exit code: $rc" >> "'"$LOGFILE"'"
+  exit $rc
+' sh "$@"
